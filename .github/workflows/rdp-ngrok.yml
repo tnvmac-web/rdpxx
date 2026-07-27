@@ -23,6 +23,10 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 360
 
+    # Required so the workflow can open an issue with the RDP details as soon as it's known.
+    permissions:
+      issues: write
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,7 +37,6 @@ jobs:
       - name: Enable RDP & set user password
         shell: pwsh
         run: |
-          # GitHub-hosted Windows runner interactive user is "runneradmin".
           $password = ConvertTo-SecureString "P@ssw0rd!" -AsPlainText -Force
           $user = Get-LocalUser -Name "runneradmin" -ErrorAction SilentlyContinue
           if ($null -eq $user) {
@@ -47,12 +50,10 @@ jobs:
             }
           }
 
-          # Enable RDP at the OS level + open firewall.
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
 
-          # Make sure TermService is running.
           Set-Service -Name "TermService" -StartupType Automatic
           Start-Service -Name "TermService"
 
@@ -69,7 +70,6 @@ jobs:
           Expand-Archive -Path "bore.zip" -DestinationPath "$env:USERPROFILE\bore" -Force
           $boreExe = "$env:USERPROFILE\bore\bore.exe"
           if (-not (Test-Path $boreExe)) {
-            # Some releases zip with/without a top folder. Find the exe.
             $found = Get-ChildItem -Path "$env:USERPROFILE\bore" -Recurse -Filter "bore.exe" | Select-Object -First 1
             if ($found) { $boreExe = $found.FullName } else { throw "bore.exe not found after extract" }
           }
@@ -86,17 +86,14 @@ jobs:
           $boreExe = $env:BORE_EXE
           Write-Host "Starting bore: $boreExe local 3389 --to bore.pub"
 
-          # Clean any stale logs.
           Remove-Item -Path "bore-stdout.log","bore-stderr.log" -ErrorAction SilentlyContinue
 
-          # Start bore in background. It prints `listening at bore.pub:<PORT>` to stdout.
           $p = Start-Process -FilePath $boreExe `
             -ArgumentList @("local","3389","--to","bore.pub") `
             -RedirectStandardOutput "bore-stdout.log" `
             -RedirectStandardError  "bore-stderr.log" `
             -PassThru -NoNewWindow
 
-          # Poll the stdout log for the listening line. bore usually takes 1–3s.
           $assigned = $null
           for ($i = 0; $i -lt 30; $i++) {
             if (Test-Path "bore-stdout.log") {
@@ -126,7 +123,8 @@ jobs:
 
           $host_ = "bore.pub"
           $port_ = $assigned
-          $line  = "============================================================"
+
+          $line = "============================================================"
           Write-Host $line
           Write-Host "  RDP READY — connect with mstsc.exe"
           Write-Host "  Address  : ${host_}:${port_}"
@@ -139,9 +137,62 @@ jobs:
 
           "RDP_HOST=$host_" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "RDP_PORT=$port_" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RDP_USER=runneradmin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RDP_PASS=P@ssw0rd!"   | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          # Also write the connection info as a step summary so it shows in the Actions UI.
+          @"
+          ## 🖥️ RDP READY
+          - **Address**: ${host_}:${port_}
+          - **Username**: \`runneradmin\`
+          - **Password**: \`P@ssw0rd!\`
+          - **Connect**: \`mstsc /v:${host_}:${port_}\`
+          - **Lifetime**: ~6h (this Actions job)
+          - **Tunnel**: bore.pub (free)
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
 
       # ─────────────────────────────────────────────────────────
-      # 4. Keep alive — the tunnel dies when the job ends.
+      # 4. Publish the connection details as an issue in this repo.
+      #    The runner's GITHUB_TOKEN has issues:write permission we declared at the job level.
+      #    The issue title contains the run id so we can find/close it programmatically.
+      # ─────────────────────────────────────────────────────────
+      - name: Publish RDP details to issue
+        env:
+          RDP_HOST: ${{ env.RDP_HOST }}
+          RDP_PORT: ${{ env.RDP_PORT }}
+          RDP_USER: ${{ env.RDP_USER }}
+          RDP_PASS: ${{ env.RDP_PASS }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `RDP-active-run-${{ github.run_id }}`;
+            const body  = [
+              '## 🖥️ RDP session is LIVE',
+              '',
+              `Run: \`${{ github.run_id }}\` · Workflow: \`${{ github.workflow }}\` · Started: \`${{ github.event.head_commit.timestamp || github.run_attempt }}\``,
+              '',
+              `- **Address**: \`${process.env.RDP_HOST}:${process.env.RDP_PORT}\``,
+              `- **Username**: \`${process.env.RDP_USER}\``,
+              `- **Password**: \`${process.env.RDP_PASS}\``,
+              `- **Connect**: \`mstsc /v:${process.env.RDP_HOST}:${process.env.RDP_PORT}\``,
+              `- **Lifetime**: ~6h (this Actions job)`,
+              '',
+              '_This issue is auto-created by the workflow. It will close when the job ends._',
+            ].join('\n');
+            // Look for an existing open issue with this run's title (re-trigger cases).
+            const q = `repo:${process.env.GITHUB_REPOSITORY} is:issue is:open in:title "${title}"`;
+            const found = await github.rest.search.issuesAndPullRequests({ q });
+            if (found.data.total_count > 0) {
+              const num = found.data.items[0].number;
+              await github.rest.issues.update({ owner: context.repo.owner, repo: context.repo.repo, issue_number: num, body });
+              core.info(`Updated issue #${num}`);
+            } else {
+              const created = await github.rest.issues.create({ owner: context.repo.owner, repo: context.repo.repo, title, body });
+              core.info(`Created issue #${created.data.number}`);
+            }
+
+      # ─────────────────────────────────────────────────────────
+      # 5. Keep alive — the tunnel dies when the job ends.
       # ─────────────────────────────────────────────────────────
       - name: Keep alive (up to ~6h)
         shell: pwsh
