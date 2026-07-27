@@ -1,7 +1,7 @@
-name: RDP via ngrok
+name: RDP via bore tunnel
 
 # Manual + scheduled. 6h per run, fresh each time.
-on:
+"on":
   workflow_dispatch:
     inputs:
       keep_alive_hours:
@@ -9,7 +9,7 @@ on:
         required: false
         default: '6'
   schedule:
-    # 4x/day is enough; each run ~6h. Adjust/disable if not needed.
+    # 4x/day. Each run ~6h. Adjust/disable if not needed.
     - cron: '0 0,6,12,18 * * *'
 
 # GitHub caps a single job at 6h.
@@ -28,17 +28,16 @@ jobs:
         uses: actions/checkout@v4
 
       # ─────────────────────────────────────────────────────────
-      # 1. Enable RDP on the runner + set the runneradmin password
+      # 1. Enable RDP on the runner & set runneradmin password
       # ─────────────────────────────────────────────────────────
       - name: Enable RDP & set user password
         shell: pwsh
         run: |
-          # The GitHub-hosted Windows runner's interactive user is "runneradmin".
-          # We set a known password on it so we can RDP in.
+          # GitHub-hosted Windows runner interactive user is "runneradmin".
           $password = ConvertTo-SecureString "P@ssw0rd!" -AsPlainText -Force
           $user = Get-LocalUser -Name "runneradmin" -ErrorAction SilentlyContinue
           if ($null -eq $user) {
-            Write-Host "runneradmin not found — creating it (rare; usually exists on windows-latest)"
+            Write-Host "runneradmin not found — creating it"
             New-LocalUser -Name "runneradmin" -Password $password -FullName "runneradmin" -Description "GitHub Actions RDP user"
             Add-LocalGroupMember -Group "Administrators" -Member "runneradmin"
           } else {
@@ -48,99 +47,101 @@ jobs:
             }
           }
 
-          # Enable RDP at the OS level.
+          # Enable RDP at the OS level + open firewall.
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
 
-          # Make sure the TermService is running.
+          # Make sure TermService is running.
           Set-Service -Name "TermService" -StartupType Automatic
           Start-Service -Name "TermService"
 
-          Write-Host "RDP enabled on runneradmin / P@ssw0rd!"
+          Write-Host "RDP enabled. Username: runneradmin  Password: P@ssw0rd!"
 
       # ─────────────────────────────────────────────────────────
-      # 2. Download + authenticate ngrok
+      # 2. Download + install bore (free TCP tunnel, no account, no card)
       # ─────────────────────────────────────────────────────────
-      - name: Install & auth ngrok
+      - name: Install bore
         shell: pwsh
         run: |
-          $ngrokUrl = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
-          Invoke-WebRequest -Uri $ngrokUrl -OutFile "ngrok.zip" -UseBasicParsing
-          Expand-Archive -Path "ngrok.zip" -DestinationPath "$env:USERPROFILE\ngrok" -Force
-          $ngrokExe = "$env:USERPROFILE\ngrok\ngrok.exe"
-          Test-Path $ngrokExe
-          # Auth — token baked in as requested by repo owner.
-          & $ngrokExe config add-authtoken "3H4TjJYutnnFRrEgSXaZL22wmBF_7V7wZNYSQ2X1LMZijfnvy"
-          Write-Host "ngrok authenticated."
-
-          # Expose the path for later steps via GITHUB_ENV.
-          "NGROK_EXE=$ngrokExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $url = "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip"
+          Invoke-WebRequest -Uri $url -OutFile "bore.zip" -UseBasicParsing
+          Expand-Archive -Path "bore.zip" -DestinationPath "$env:USERPROFILE\bore" -Force
+          $boreExe = "$env:USERPROFILE\bore\bore.exe"
+          if (-not (Test-Path $boreExe)) {
+            # Some releases zip with/without a top folder. Find the exe.
+            $found = Get-ChildItem -Path "$env:USERPROFILE\bore" -Recurse -Filter "bore.exe" | Select-Object -First 1
+            if ($found) { $boreExe = $found.FullName } else { throw "bore.exe not found after extract" }
+          }
+          Write-Host "bore at: $boreExe"
+          & $boreExe --version
+          "BORE_EXE=$boreExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       # ─────────────────────────────────────────────────────────
-      # 3. Start ngrok TCP tunnel to localhost:3389 and parse the public endpoint
+      # 3. Start bore TCP tunnel to localhost:3389 and capture assigned port
       # ─────────────────────────────────────────────────────────
-      - name: Start ngrok tunnel & capture endpoint
+      - name: Start bore tunnel & capture endpoint
         shell: pwsh
         run: |
-          $ngrokExe = $env:NGROK_EXE
-          # Start ngrok in the background pointing at RDP.
-          Start-Process -FilePath $ngrokExe -ArgumentList "tcp","3389","--log=stdout","--log-format=logfmt" -RedirectStandardOutput "ngrok-stdout.log" -RedirectStandardError "ngrok-stderr.log" -NoNewWindow
-          # Give ngrok a few seconds to register the tunnel.
-          Start-Sleep -Seconds 10
+          $boreExe = $env:BORE_EXE
+          Write-Host "Starting bore: $boreExe local 3389 --to bore.pub"
 
-          # Query ngrok's local API for the public endpoint. ngrok always exposes
-          # its API on 127.0.0.1:4040 when running a single tunnel.
-          $api = "http://127.0.0.1:4040/api/tunnels"
-          $tunnelUrl = $null
+          # Clean any stale logs.
+          Remove-Item -Path "bore-stdout.log","bore-stderr.log" -ErrorAction SilentlyContinue
+
+          # Start bore in background. It prints `listening at bore.pub:<PORT>` to stdout.
+          $p = Start-Process -FilePath $boreExe `
+            -ArgumentList @("local","3389","--to","bore.pub") `
+            -RedirectStandardOutput "bore-stdout.log" `
+            -RedirectStandardError  "bore-stderr.log" `
+            -PassThru -NoNewWindow
+
+          # Poll the stdout log for the listening line. bore usually takes 1–3s.
+          $assigned = $null
           for ($i = 0; $i -lt 30; $i++) {
-            try {
-              $resp = Invoke-RestMethod -Uri $api -TimeoutSec 5
-              $tcp = $resp.tunnels | Where-Object { $_.proto -eq "tcp" } | Select-Object -First 1
-              if ($tcp -and $tcp.public_url) {
-                $tunnelUrl = $tcp.public_url
+            if (Test-Path "bore-stdout.log") {
+              $content = Get-Content "bore-stdout.log" -ErrorAction SilentlyContinue
+              $match = $content | Select-String -Pattern "listening (?:on|at)\s+bore\.pub:(\d+)" -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($match) {
+                $assigned = $match.Matches[0].Groups[1].Value
+                Write-Host "Detected bore listening port: $assigned"
                 break
               }
-            } catch {
-              Start-Sleep -Seconds 2
             }
+            Start-Sleep -Seconds 1
           }
 
-          if (-not $tunnelUrl) {
-            Write-Host "ngrok API did not return a tunnel URL. Dumping stdout/stderr for diagnosis:"
-            Write-Host "── stdout ──"
-            if (Test-Path "ngrok-stdout.log") { Get-Content "ngrok-stdout.log" -Tail 40 | Write-Host }
-            Write-Host "── stderr ──"
-            if (Test-Path "ngrok-stderr.log") { Get-Content "ngrok-stderr.log" -Tail 40 | Write-Host }
+          if (-not $assigned) {
+            Write-Host ""
+            Write-Host "########## DIAGNOSTICS — bore did not report a listening port ##########"
+            Write-Host "--- bore stdout (full) ---"
+            if (Test-Path "bore-stdout.log") { Get-Content "bore-stdout.log" | ForEach-Object { Write-Host $_ } }
+            Write-Host "--- bore stderr (full) ---"
+            if (Test-Path "bore-stderr.log") { Get-Content "bore-stderr.log" | ForEach-Object { Write-Host $_ } }
+            Write-Host "--- bore process state ---"
+            if ($p.HasExited) { Write-Host "bore EXITED (code=$($p.ExitCode))" } else { Write-Host "bore still running, but no listening line after 30s" }
+            Write-Host "#########################################################"
             exit 1
           }
 
-          # $tunnelUrl looks like "tcp://0.tcp.ngrok.io:12345"
-          Write-Host "ngrok public TCP URL: $tunnelUrl"
-          $addr = $tunnelUrl -replace '^tcp://',''
-          # Split off the port.
-          $parts = $addr -split ':'
-          $ipOrHost = $parts[0]
-          $port = if ($parts.Length -gt 1) { $parts[1] } else { "3389" }
-
-          # Human-readable banner in the log — this is what you'll open with mstsc.exe.
-          $line = "============================================================"
+          $host_ = "bore.pub"
+          $port_ = $assigned
+          $line  = "============================================================"
           Write-Host $line
-          Write-Host "  RDP READY"
-          Write-Host "  Address  : ${ipOrHost}:${port}"
+          Write-Host "  RDP READY — connect with mstsc.exe"
+          Write-Host "  Address  : ${host_}:${port_}"
           Write-Host "  Username : runneradmin"
           Write-Host "  Password : P@ssw0rd!"
-          Write-Host "  Connect  : mstsc /v:${ipOrHost}:${port}"
+          Write-Host "  Connect  : mstsc /v:${host_}:${port_}"
           Write-Host "  Lifetime : ~6h (this Actions job)"
+          Write-Host "  Tunnel   : bore.pub (free, no account, no card)"
           Write-Host $line
 
-          # Persist for the keep-alive step so it can re-print at the end.
-          "RDP_HOST=$ipOrHost" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "RDP_PORT=$port"     | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RDP_HOST=$host_" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RDP_PORT=$port_" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       # ─────────────────────────────────────────────────────────
-      # 4. Keep the job alive — the tunnel dies when the job ends.
-      #    Heartbeat every 5m, plus a final banner near the end.
+      # 4. Keep alive — the tunnel dies when the job ends.
       # ─────────────────────────────────────────────────────────
       - name: Keep alive (up to ~6h)
         shell: pwsh
@@ -155,7 +156,7 @@ jobs:
           if ($hours -gt 6) { $hours = 6 }
           $targetSeconds = $hours * 3600
           $slept = 0
-          $tick = 300  # 5 minute heartbeat
+          $tick = 300  # 5-minute heartbeat
           Write-Host "Keep-alive target: $($hours)h. RDP = $($env:RDP_HOST):$($env:RDP_PORT)"
           while ($slept -lt $targetSeconds) {
             $remaining = $targetSeconds - $slept
@@ -164,6 +165,6 @@ jobs:
             $slept += $sleep
             $hLeft  = [int][Math]::Floor($remaining / 3600)
             $mLeft  = [int][Math]::Floor(($remaining % 3600) / 60)
-            Write-Host "heartbeat @ ${slept}s elapsed — RDP still live on $($env:RDP_HOST):$($env:RDP_PORT) (runneradmin / P@ssw0rd!) — ~$($hLeft)h$($mLeft)m left"
+            Write-Host "heartbeat @ ${slept}s — RDP still live on $($env:RDP_HOST):$($env:RDP_PORT) (runneradmin / P@ssw0rd!) — ~$($hLeft)h$($mLeft)m left"
           }
-          Write-Host "Keep-alive window exhausted — ngrok tunnel will close as the job exits."
+          Write-Host "Keep-alive window exhausted — bore tunnel will close as the job exits."
